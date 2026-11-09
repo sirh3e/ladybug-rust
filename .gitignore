@@ -1,0 +1,4 @@
+target
+# Where build.rs caches the prebuilt engine of a checkout from before the cache moved
+# under OUT_DIR.
+.cache
