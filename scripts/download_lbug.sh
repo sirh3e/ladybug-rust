@@ -9,12 +9,13 @@ ENV_FILE="${1:-$PROJECT_DIR/.cache/lbug-prebuilt.env}"
 CACHE_LIB_DIR="${LBUG_TARGET_DIR:-$PROJECT_DIR/.cache/lbug-prebuilt/lib}"
 LIB_KIND="${LBUG_LIB_KIND:-static}"
 UPSTREAM_SCRIPT="$SCRIPT_DIR/download-liblbug.sh"
-UPSTREAM_URL="https://raw.githubusercontent.com/LadybugDB/ladybug/refs/heads/main/scripts/download-liblbug.sh"
 
+# download-liblbug.sh ships beside this one, so a missing one is a broken checkout, not
+# something to repair over the network: this used to curl it from the engine's `main`
+# branch -- an unpinned, unverified script that it then ran with bash.
 if [ ! -f "$UPSTREAM_SCRIPT" ]; then
-  echo "Fetching $UPSTREAM_URL ..."
-  curl -fsSL "$UPSTREAM_URL" -o "$UPSTREAM_SCRIPT"
-  chmod +x "$UPSTREAM_SCRIPT"
+  echo "Missing $UPSTREAM_SCRIPT; this checkout of the crate is incomplete" >&2
+  exit 1
 fi
 
 LBUG_TARGET_DIR="$CACHE_LIB_DIR" LBUG_LIB_KIND="$LIB_KIND" bash "$UPSTREAM_SCRIPT"
