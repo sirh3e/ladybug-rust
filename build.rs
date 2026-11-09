@@ -120,11 +120,28 @@ fn prebuilt_cache_key() -> String {
         .collect()
 }
 
+/// Where the downloaded prebuilt archive lives.
+///
+/// `LBUG_PREBUILT_CACHE_DIR` names a persistent cache shared across builds and projects.
+/// Otherwise the archive goes under this build's `OUT_DIR`, which Cargo owns: a registry
+/// checkout under `~/.cargo/registry/src` is meant to be immutable, and writing the
+/// archive there breaks `cargo vendor`, read-only registries and offline builds. An
+/// archive already in the old in-tree cache is still used, so a checkout that has one
+/// does not download again.
 fn prebuilt_lib_dir(manifest_dir: &Path) -> PathBuf {
-    manifest_dir
-        .join(PREBUILT_CACHE_DIR)
-        .join(prebuilt_cache_key())
-        .join("lib")
+    let key = prebuilt_cache_key();
+    let legacy = manifest_dir.join(PREBUILT_CACHE_DIR).join(&key).join("lib");
+    if legacy.join(static_lbug_file_name()).exists() {
+        return legacy;
+    }
+    let root = env::var_os("LBUG_PREBUILT_CACHE_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| out_dir().join("lbug-prebuilt"));
+    root.join(key).join("lib")
+}
+
+fn out_dir() -> PathBuf {
+    PathBuf::from(env::var_os("OUT_DIR").expect("cargo sets OUT_DIR for build scripts"))
 }
 
 fn prebuilt_source_desc() -> String {
@@ -157,6 +174,7 @@ fn try_download_prebuilt_lbug(manifest_dir: &Path) -> bool {
         "LBUG_LIB_KIND",
         "LBUG_BUILD_FROM_SOURCE",
         "LBUG_RUST_BUILD_FROM_SOURCE",
+        "LBUG_PREBUILT_CACHE_DIR",
     ] {
         println!("cargo:rerun-if-env-changed={var}");
     }
@@ -181,8 +199,12 @@ fn try_download_prebuilt_lbug(manifest_dir: &Path) -> bool {
         return false;
     }
 
+    // The script writes the resolved paths to the env file of its first argument, which
+    // defaults to one in the crate's own directory; name one beside the library instead,
+    // so nothing is written into the crate.
     let status = std::process::Command::new("sh")
         .arg(&script)
+        .arg(lib_dir.join("lbug-prebuilt.env"))
         .env("LBUG_TARGET_DIR", &lib_dir)
         .current_dir(manifest_dir)
         .status();
