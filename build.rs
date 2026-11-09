@@ -1,5 +1,6 @@
 use std::env;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 
 const PREBUILT_CACHE_DIR: &str = ".cache/lbug-prebuilt";
 
@@ -231,11 +232,145 @@ fn use_prebuilt_lbug(manifest_dir: &Path) -> Option<Vec<PathBuf>> {
         return None;
     }
 
+    // The downloaded directory holds the headers as well as the archive; a localized
+    // archive lives elsewhere, but the headers stay where they are.
     let lib_dir = prebuilt_lib_dir(manifest_dir);
-    println!("cargo:rustc-link-search=native={}", lib_dir.display());
+    let link_dir = localize_bundled_symbols(&lib_dir).unwrap_or_else(|| lib_dir.clone());
+    println!("cargo:rustc-link-search=native={}", link_dir.display());
     println!("cargo:rerun-if-changed={}", lib_dir.display());
-    emit_lbug_metadata(&prebuilt_source_desc(), &lib_dir);
+    emit_lbug_metadata(&prebuilt_source_desc(), &link_dir);
     Some(vec![lib_dir])
+}
+
+/// Hide the third-party C symbols the prebuilt archive carries, on request.
+///
+/// `liblbug.a` bundles zstd, lz4, brotli, simsimd, yyjson and CRoaring with their
+/// ordinary exported names (`ZSTD_compressBound`, `roaring_bitmap_add`, even bare helpers
+/// such as `get` and `union`). A binary that also links the Rust crates for those
+/// libraries (`zstd-sys`, `lz4-sys`, `simsimd`, `croaring-sys`, …) fails to link on Linux
+/// with `rust-lld`: duplicate symbol, twenty times over, whereas macOS `ld64` silently
+/// keeps whichever copy comes first.
+///
+/// With `LBUG_LOCALIZE_BUNDLED_SYMBOLS=1` on an ELF target the archive is partially
+/// linked into one relocatable object, every unmangled global symbol except the `lbug_*`
+/// C API is made local, and the result is archived back under `OUT_DIR`. Internal
+/// references resolve inside that object, the C++ API (mangled `lbug::` symbols) and the
+/// C API stay global, and the bundled libraries no longer collide with anyone else's
+/// copy. It is opt-in because a dynamically loaded extension that expects to resolve one
+/// of those bundled symbols from the host binary would stop finding it. Needs `ld`,
+/// `objcopy`, `nm` and `ar` (GNU binutils); without them the archive is used as it came.
+fn localize_bundled_symbols(lib_dir: &Path) -> Option<PathBuf> {
+    println!("cargo:rerun-if-env-changed=LBUG_LOCALIZE_BUNDLED_SYMBOLS");
+    let requested = env::var("LBUG_LOCALIZE_BUNDLED_SYMBOLS")
+        .map(|value| value != "0" && !value.is_empty())
+        .unwrap_or(false);
+    if !requested || !cfg!(target_os = "linux") || link_mode() != "static" {
+        return None;
+    }
+    let archive = lib_dir.join(static_lbug_file_name());
+    if !archive.exists() {
+        return None;
+    }
+    let work = out_dir().join("lbug-localized");
+    let out_lib_dir = work.join("lib");
+    let localized = out_lib_dir.join(static_lbug_file_name());
+    if localized.exists() {
+        return Some(out_lib_dir);
+    }
+    if let Err(error) = std::fs::create_dir_all(&out_lib_dir) {
+        println!(
+            "cargo:warning=Cannot create {}: {error}; linking liblbug as it came",
+            work.display()
+        );
+        return None;
+    }
+    let merged = work.join("lbug-merged.o");
+    let keep = work.join("keep-global.txt");
+    let steps: [(&str, Vec<std::ffi::OsString>); 3] = [
+        (
+            "ld",
+            vec![
+                "-r".into(),
+                "--whole-archive".into(),
+                archive.clone().into(),
+                "--no-whole-archive".into(),
+                "-o".into(),
+                merged.clone().into(),
+            ],
+        ),
+        (
+            "nm",
+            vec![
+                "--defined-only".into(),
+                "-g".into(),
+                "--format=posix".into(),
+                merged.clone().into(),
+            ],
+        ),
+        (
+            "ar",
+            vec![
+                "rcs".into(),
+                localized.clone().into(),
+                merged.clone().into(),
+            ],
+        ),
+    ];
+    for (tool, args) in &steps {
+        let output = match Command::new(tool).args(args).output() {
+            Ok(output) => output,
+            Err(error) => {
+                println!("cargo:warning=Cannot run {tool} ({error}); linking liblbug as it came");
+                return None;
+            }
+        };
+        if !output.status.success() {
+            println!(
+                "cargo:warning={tool} failed while localizing liblbug symbols; linking it as it came"
+            );
+            return None;
+        }
+        if *tool == "nm" {
+            // Localize only strong, unmangled symbols outside the C API: the bundled
+            // libraries' functions and data. Mangled C++ symbols are the API this crate
+            // binds, and weak symbols (COMDAT groups such as
+            // `DW.ref.__gxx_personality_v0`, template instantiations) must stay global so
+            // the linker can still deduplicate them.
+            let listing = String::from_utf8_lossy(&output.stdout);
+            let keep_names: Vec<&str> = listing
+                .lines()
+                .filter_map(|line| {
+                    let mut fields = line.split(' ');
+                    Some((fields.next()?, fields.next()?))
+                })
+                .filter(|(name, kind)| {
+                    let strong = matches!(*kind, "T" | "D" | "B" | "R");
+                    !strong || name.starts_with("_Z") || name.starts_with("lbug_")
+                })
+                .map(|(name, _)| name)
+                .collect();
+            if std::fs::write(&keep, keep_names.join("\n")).is_err() {
+                return None;
+            }
+            // `--keep-global-symbols` makes every defined symbol local except the listed
+            // ones; undefined references are left alone.
+            let status = Command::new("objcopy")
+                .arg(format!("--keep-global-symbols={}", keep.display()))
+                .arg(&merged)
+                .status();
+            match status {
+                Ok(status) if status.success() => {}
+                _ => {
+                    println!(
+                        "cargo:warning=objcopy failed while localizing liblbug symbols; linking \
+                         it as it came"
+                    );
+                    return None;
+                }
+            }
+        }
+    }
+    Some(out_lib_dir)
 }
 
 fn get_lbug_root() -> PathBuf {
@@ -406,9 +541,16 @@ fn main() {
     if let (Ok(lbug_lib_dir), Ok(lbug_include)) =
         (env::var("LBUG_LIBRARY_DIR"), env::var("LBUG_INCLUDE_DIR"))
     {
-        println!("cargo:rustc-link-search=native={lbug_lib_dir}");
+        // A library handed to us is localized too, not just one this script downloaded:
+        // whoever points LBUG_LIBRARY_DIR at an archive links it beside zstd-sys and the
+        // other bundled libraries' crates just the same. Upstream localizes only its own
+        // download. The rpath stays the directory given, which is where a shared library
+        // would be; the localized archive is static, so it needs none.
+        let given = PathBuf::from(&lbug_lib_dir);
+        let link_dir = localize_bundled_symbols(&given).unwrap_or(given);
+        println!("cargo:rustc-link-search=native={}", link_dir.display());
         println!("cargo:rustc-link-arg=-Wl,-rpath,{lbug_lib_dir}");
-        emit_lbug_metadata("external", Path::new(&lbug_lib_dir));
+        emit_lbug_metadata("external", &link_dir);
         include_paths.push(Path::new(&lbug_include).to_path_buf());
     } else if let Some(prebuilt_include_paths) = use_prebuilt_lbug(&manifest_dir) {
         include_paths.extend(prebuilt_include_paths);
